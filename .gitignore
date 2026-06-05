@@ -1,3 +1,5 @@
+/build
+/install
 *.pydevproject
 .project
 .metadata

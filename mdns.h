@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #endif
 
 #ifdef __cplusplus
@@ -291,6 +292,10 @@ static inline int
 mdns_announce_multicast(int sock, void* buffer, size_t capacity, mdns_record_t answer,
                         const mdns_record_t* authority, size_t authority_count,
                         const mdns_record_t* additional, size_t additional_count);
+static inline int
+mdns_announce_unicast(int sock, void* buffer, size_t capacity, mdns_record_t answer,
+                        const mdns_record_t* authority, size_t authority_count,
+                        const mdns_record_t* additional, size_t additional_count, const char* peer);
 
 //! Send a variable multicast mDNS announcement. Use this on service end for removing the resource
 //! from the local network. The records must be identical to the according announcement.
@@ -809,9 +814,11 @@ mdns_records_parse(int sock, const struct sockaddr* from, size_t addrlen, const 
 static inline int
 mdns_unicast_send(int sock, const void* address, size_t address_size, const void* buffer,
                   size_t size) {
-	if (sendto(sock, (const char*)buffer, (mdns_size_t)size, 0, (const struct sockaddr*)address,
-	           (socklen_t)address_size) < 0)
+	int res = 0;
+	if ((res = sendto(sock, (const char*)buffer, (mdns_size_t)size, 0, (const struct sockaddr*)address,
+	           (socklen_t)address_size)) < 0) {
 		return -1;
+	}
 	return 0;
 }
 
@@ -848,8 +855,10 @@ mdns_multicast_send(int sock, const void* buffer, size_t size) {
 		saddrlen = sizeof(addr);
 	}
 
-	if (sendto(sock, (const char*)buffer, (mdns_size_t)size, 0, saddr, saddrlen) < 0)
+	int res = 0;
+	if ((res = sendto(sock, (const char*)buffer, (mdns_size_t)size, 0, saddr, saddrlen) < 0)) {
 		return -1;
+	}
 	return 0;
 }
 
@@ -1473,6 +1482,69 @@ mdns_answer_multicast_rclass_ttl(int sock, void* buffer, size_t capacity, mdns_r
 }
 
 static inline int
+mdns_answer_unicast_rclass_ttl(int sock, void* buffer, size_t capacity, mdns_record_t answer,
+                                 const mdns_record_t* authority, size_t authority_count,
+                                 const mdns_record_t* additional, size_t additional_count,
+                                 uint16_t rclass, uint32_t ttl, const char* peer) {
+	if (capacity < (sizeof(struct mdns_header_t) + 32 + 4))
+		return -1;
+
+	// Basic answer structure
+	struct mdns_header_t* header = (struct mdns_header_t*)buffer;
+	header->query_id = 0;
+	header->flags = htons(0x8400);
+	header->questions = 0;
+	header->answer_rrs = htons(1);
+	header->authority_rrs = htons(mdns_answer_get_record_count(authority, authority_count));
+	header->additional_rrs = htons(mdns_answer_get_record_count(additional, additional_count));
+
+	mdns_string_table_t string_table = {{0}, 0, 0};
+	void* data = MDNS_POINTER_OFFSET(buffer, sizeof(struct mdns_header_t));
+
+	// Fill in answer
+	mdns_record_t record = answer;
+	mdns_record_update_rclass_ttl(&record, rclass, ttl);
+	data = mdns_answer_add_record(buffer, capacity, data, record, &string_table);
+
+	// Fill in authority records
+	for (size_t irec = 0; data && (irec < authority_count); ++irec) {
+		record = authority[irec];
+		mdns_record_update_rclass_ttl(&record, rclass, ttl);
+		data = mdns_answer_add_record(buffer, capacity, data, record, &string_table);
+	}
+	data = mdns_answer_add_txt_record(buffer, capacity, data, authority, authority_count,
+	                                  rclass, ttl, &string_table);
+
+	// Fill in additional records
+	for (size_t irec = 0; data && (irec < additional_count); ++irec) {
+		record = additional[irec];
+		mdns_record_update_rclass_ttl(&record, rclass, ttl);
+		data = mdns_answer_add_record(buffer, capacity, data, record, &string_table);
+	}
+	data = mdns_answer_add_txt_record(buffer, capacity, data, additional, additional_count,
+	                                  rclass, ttl, &string_table);
+	if (!data)
+		return -1;
+
+	size_t tosend = MDNS_POINTER_DIFF(data, buffer);
+
+	if (peer != NULL) {
+		struct sockaddr_in sock_addr;
+		memset(&sock_addr, 0, sizeof(struct sockaddr_in));
+		sock_addr.sin_family = AF_INET;
+		if (inet_aton(peer, &sock_addr.sin_addr) == 0) return -1;
+		sock_addr.sin_port = htons(MDNS_PORT);
+#ifdef __APPLE__
+		sock_addr.sin_len = sizeof(struct sockaddr_in);
+#endif
+
+		return mdns_unicast_send(sock, &sock_addr, sizeof(struct sockaddr_in), buffer, tosend);
+	}
+
+	return mdns_multicast_send(sock, buffer, tosend);
+}
+
+static inline int
 mdns_query_answer_multicast(int sock, void* buffer, size_t capacity, mdns_record_t answer,
                             const mdns_record_t* authority, size_t authority_count,
                             const mdns_record_t* additional, size_t additional_count) {
@@ -1488,6 +1560,15 @@ mdns_announce_multicast(int sock, void* buffer, size_t capacity, mdns_record_t a
 	return mdns_answer_multicast_rclass_ttl(sock, buffer, capacity, answer, authority,
 	                                        authority_count, additional, additional_count,
 	                                        MDNS_CLASS_IN | MDNS_CACHE_FLUSH, 60);
+}
+
+static inline int
+mdns_announce_unicast(int sock, void* buffer, size_t capacity, mdns_record_t answer,
+                        const mdns_record_t* authority, size_t authority_count,
+                        const  mdns_record_t* additional, size_t additional_count, const char* peer) {
+	return mdns_answer_unicast_rclass_ttl(sock, buffer, capacity, answer, authority,
+	                                        authority_count, additional, additional_count,
+	                                        MDNS_CLASS_IN | MDNS_CACHE_FLUSH, 60, peer);
 }
 
 static inline int

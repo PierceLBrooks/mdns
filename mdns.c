@@ -451,7 +451,7 @@ dump_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry_
 
 // Open sockets for sending one-shot multicast queries from an ephemeral port
 static int
-open_client_sockets(int* sockets, int max_sockets, int port) {
+open_client_sockets(int* sockets, int max_sockets, int port, const char* peer) {
 	// When sending, each socket can only send to one network interface
 	// Thus we need to open one socket for each interface and address family
 	int num_sockets = 0;
@@ -576,7 +576,7 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 	for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
 		if (!ifa->ifa_addr)
 			continue;
-		if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_MULTICAST))
+		if (!(ifa->ifa_flags & IFF_UP) || (!(ifa->ifa_flags & IFF_MULTICAST) && peer == NULL))
 			continue;
 		if ((ifa->ifa_flags & IFF_LOOPBACK) || (ifa->ifa_flags & IFF_POINTOPOINT))
 			continue;
@@ -655,31 +655,54 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 
 // Open sockets to listen to incoming mDNS queries on port 5353
 static int
-open_service_sockets(int* sockets, int max_sockets) {
+open_service_sockets(int* sockets, int max_sockets, const char* peer) {
 	// When recieving, each socket can recieve data from all network interfaces
 	// Thus we only need to open one socket for each address family
 	int num_sockets = 0;
 
 	// Call the client socket function to enumerate and get local addresses,
 	// but not open the actual sockets
-	open_client_sockets(0, 0, 0);
+	open_client_sockets(0, 0, 0, peer);
 
 	if (num_sockets < max_sockets) {
 		struct sockaddr_in sock_addr;
 		memset(&sock_addr, 0, sizeof(struct sockaddr_in));
 		sock_addr.sin_family = AF_INET;
+		if (peer == NULL) {
 #ifdef _WIN32
-		sock_addr.sin_addr = in4addr_any;
+			sock_addr.sin_addr = in4addr_any;
 #else
-		sock_addr.sin_addr.s_addr = INADDR_ANY;
+			sock_addr.sin_addr.s_addr = INADDR_ANY;
 #endif
+		} else {
+			inet_aton(peer, &sock_addr.sin_addr);
+		}
 		sock_addr.sin_port = htons(MDNS_PORT);
 #ifdef __APPLE__
 		sock_addr.sin_len = sizeof(struct sockaddr_in);
 #endif
-		int sock = mdns_socket_open_ipv4(&sock_addr);
-		if (sock >= 0)
+		int sock = -1;
+		if (peer == NULL) {
+			sock = mdns_socket_open_ipv4(&sock_addr);
+		} else {
+			sock = socket(AF_INET, SOCK_DGRAM, 0);
+			if (sock > 0) {
+#ifdef _WIN32
+				unsigned long param = 1;
+				ioctlsocket(sock, FIONBIO, &param);
+#else
+				const int flags = fcntl(sock, F_GETFL, 0);
+				fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+			  int conn_err = connect(sock, (struct sockaddr*)&sock_addr, sizeof(struct sockaddr_in));
+			  if (conn_err != 0) {
+			    sock = -1;
+			  }
+			}
+		}
+		if (sock >= 0) {
 			sockets[num_sockets++] = sock;
+		}
 	}
 
 	if (num_sockets < max_sockets) {
@@ -703,7 +726,7 @@ open_service_sockets(int* sockets, int max_sockets) {
 static int
 send_dns_sd(void) {
 	int sockets[32];
-	int num_sockets = open_client_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]), 0);
+	int num_sockets = open_client_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]), 0, NULL);
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
@@ -764,7 +787,7 @@ static int
 send_mdns_query(mdns_query_t* query, size_t count) {
 	int sockets[32];
 	int query_id[32];
-	int num_sockets = open_client_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]), 0);
+	int num_sockets = open_client_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]), 0, NULL);
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
@@ -841,9 +864,9 @@ send_mdns_query(mdns_query_t* query, size_t count) {
 
 // Provide a mDNS service, answering incoming DNS-SD and mDNS queries
 static int
-service_mdns(const char* hostname, const char* service_name, int service_port) {
+service_mdns(const char* hostname, const char* service_name, int service_port, const char* peer, int loops) {
 	int sockets[32];
-	int num_sockets = open_service_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]));
+	int num_sockets = open_service_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]), peer);
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
@@ -945,7 +968,7 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 	                                        .ttl = 0};
 
 	// Send an announcement on startup of service
-	{
+	if (peer == NULL) {
 		printf("Sending announce\n");
 		mdns_record_t additional[5] = {0};
 		size_t additional_count = 0;
@@ -958,12 +981,33 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 		additional[additional_count++] = service.txt_record[1];
 
 		for (int isock = 0; isock < num_sockets; ++isock)
-			mdns_announce_multicast(sockets[isock], buffer, capacity, service.record_ptr, 0, 0,
-			                        additional, additional_count);
+			if (mdns_announce_multicast(sockets[isock], buffer, capacity, service.record_ptr, 0, 0,
+			                        additional, additional_count) < 0)
+				printf("Announcement failure: %s\n", strerror(errno));
 	}
 
 	// This is a crude implementation that checks for incoming queries
-	while (running) {
+	int loop = 0;
+	while (running && (loops < 0 || loop < loops)) {
+		loop++;
+		if (peer != NULL) {
+			mdns_record_t additional[5] = {0};
+			size_t additional_count = 0;
+			additional[additional_count++] = service.record_srv;
+			if (service.address_ipv4.sin_family == AF_INET)
+				additional[additional_count++] = service.record_a;
+			if (service.address_ipv6.sin6_family == AF_INET6)
+				additional[additional_count++] = service.record_aaaa;
+			additional[additional_count++] = service.txt_record[0];
+			additional[additional_count++] = service.txt_record[1];
+
+			for (int isock = 0; isock < num_sockets; ++isock)
+				if (mdns_announce_unicast(sockets[isock], buffer, capacity, service.record_ptr, 0, 0,
+				                        additional, additional_count, peer) < 0)
+					printf("Announcement failure: %s\n", strerror(errno));
+			sleep(1);
+			continue;
+		}
 		int nfds = 0;
 		fd_set readfs;
 		FD_ZERO(&readfs);
@@ -991,7 +1035,7 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 	}
 
 	// Send a goodbye on end of service
-	{
+	if (peer == NULL) {
 		printf("Sending goodbye\n");
 		mdns_record_t additional[5] = {0};
 		size_t additional_count = 0;
@@ -1004,8 +1048,9 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 		additional[additional_count++] = service.txt_record[1];
 
 		for (int isock = 0; isock < num_sockets; ++isock)
-			mdns_goodbye_multicast(sockets[isock], buffer, capacity, service.record_ptr, 0, 0,
-			                       additional, additional_count);
+			if (mdns_goodbye_multicast(sockets[isock], buffer, capacity, service.record_ptr, 0, 0,
+			                       additional, additional_count) < 0)
+				printf("Goodbye failure\n");
 	}
 
 	free(buffer);
@@ -1022,7 +1067,7 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 static int
 dump_mdns(void) {
 	int sockets[32];
-	int num_sockets = open_service_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]));
+	int num_sockets = open_service_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]), NULL);
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
@@ -1161,6 +1206,7 @@ void signal_handler(int signal) {
 int
 main(int argc, const char* const* argv) {
 	int mode = 0;
+	const char* peer = NULL;
 	const char* service = "_test-mdns._tcp.local.";
 	const char* hostname = "dummy-host";
 	mdns_query_t query[16];
@@ -1228,6 +1274,10 @@ main(int argc, const char* const* argv) {
 			++iarg;
 			if (iarg < argc)
 				service = argv[iarg];
+		} else if (strcmp(argv[iarg], "--peer") == 0) {
+			++iarg;
+			if (iarg < argc)
+				peer = argv[iarg];
 		} else if (strcmp(argv[iarg], "--dump") == 0) {
 			mode = 3;
 		} else if (strcmp(argv[iarg], "--hostname") == 0) {
@@ -1250,7 +1300,7 @@ main(int argc, const char* const* argv) {
 	else if (mode == 1)
 		ret = send_mdns_query(query, query_count);
 	else if (mode == 2)
-		ret = service_mdns(hostname, service, service_port);
+		ret = service_mdns(hostname, service, service_port, peer, -1);
 	else if (mode == 3)
 		ret = dump_mdns();
 #endif
